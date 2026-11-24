@@ -1,0 +1,397 @@
+"""
+CareerSpark — демо-версия телеграм-бота для подбора карьерных направлений.
+Аудитория: подростки и люди, уставшие от текущей работы.
+
+Демо-стек: Python 3.10+, aiogram 3.x, SQLite (stdlib).
+Запуск:
+    pip install -U aiogram
+    BOT_TOKEN=ваш_токен python career_spark_bot.py
+"""
+
+import asyncio
+import json
+import logging
+import os
+import sqlite3
+import time
+
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+)
+
+BOT_TOKEN = os.getenv("BOT_TOKEN", "PASTE_YOUR_TOKEN_HERE")
+DB_PATH = "careerspark.db"
+
+router = Router()
+
+# ----------------------------------------------------------------------
+# 1. База данных
+# ----------------------------------------------------------------------
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    user_id     INTEGER PRIMARY KEY,          -- telegram user id
+    username    TEXT,
+    age_group   TEXT,                         -- teen / adult / unknown
+    fatigue     TEXT,                         -- burnout: none / tired / burned_out
+    interests   TEXT DEFAULT '[]',            -- JSON-список тегов
+    created_at  INTEGER,
+    updated_at  INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS directions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    title        TEXT NOT NULL,               -- название направления
+    emoji        TEXT DEFAULT '',             -- иконка для красивого вывода
+    description  TEXT NOT NULL,               -- короткое «зачем это»
+    tags         TEXT NOT NULL,               -- теги через запятую: it,creative...
+    audience     TEXT DEFAULT 'all',          -- teen / adult / all
+    fatigue_fit  INTEGER DEFAULT 0,           -- 0..3: насколько подходит выгоревшим
+    how_to_start TEXT,                        -- первые 3 шага
+    salary_range TEXT,                        -- ориентир по доходу (можно пусто)
+    resources    TEXT                         -- курсы/ссылки через ' | '
+);
+
+CREATE TABLE IF NOT EXISTS suggestions (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id     INTEGER,
+    text        TEXT NOT NULL,                -- идея пользователя для базы
+    processed   INTEGER DEFAULT 0,            -- 0 = новая, 1 = добавлена в базу
+    created_at  INTEGER
+);
+"""
+
+
+def db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+SEED_DIRECTIONS = [
+    ("Аналитик данных", "📊", "Превращать цифры в решения: считать, визуализировать, советовать бизнесу.",
+     "it,аналитика,математика,удалёнка", "adult", 2,
+     "1) Базовый Python и SQL (бесплатные курсы) 2) Свой мини-проект на реальных данных 3) Стажировка или pet-проект",
+     "80–250 тыс. ₽", "Stepik — SQL и Python | karpov.courses — бесплатный старт | Яндекс.Практикум"),
+    ("Разработчик игр", "🎮", "Создавать миры и механики: от простых сцен до полноценных инди-игр.",
+     "it,creative,игры,подростки", "all", 1,
+     "1) Unity или Godrock по туториалам 2) Мини-игра за выходные 3) Публикация на itch.io",
+     "от стажировки до 300 тыс. ₽", "Официальные туториалы Unity | GDQuest | itch.io"),
+    ("UX/UI-дизайнер", "🎨", "Придумывать удобные интерфейсы и рисовать то, чем пользуются миллионы.",
+     "creative,design,рисование,удалёнка", "all", 1,
+     "1) Figma (бесплатно) 2) Редизайн 3 экранов любимого приложения 3) Портфолио на Behance",
+     "60–200 тыс. ₽", "Figma Learn | Дизайн-сообщества в Telegram | Behance"),
+    ("Контент-мейкер / блогер", "🎬", "Снимать, монтировать и рассказывать истории, которые залетают.",
+     "creative,video,подростки,общение", "all", 1,
+     "1) Телефон + бесплатный монтаж (CapCut) 2) 30 дней постов подряд 3) Анализ, что зашло",
+     "0 до ∞ (зависит от аудитории)", "CapCut | YouTube-разборы сценариев | Клубы юных авторов"),
+    ("Тестировщик (QA)", "🔍", "Ломать приложения, чтобы они не сломались у пользователей.",
+     "it,внимательность,удалёнка,без_кода", "all", 2,
+     "1) Основы тестирования (бесплатные курсы) 2) Тестовые задания 3) Первая стажировка",
+     "50–150 тыс. ₽ на старте", "Stepik — основы QA | Чек-листы тестирования | Стажировки Яндекс.Практикума"),
+    ("Эко-активист / устойчивый бренд", "🌱", "Строить проекты про экологию: от сортировки до экопродуктов.",
+     "экология,общество,подростки", "all", 1,
+     "1) Волонтёрство в локальных эко-проектах 2) Свой мини-проект (сбор вторсырья) 3) Гранты для молодых инициатив",
+     "гранты / проектная оплата", "Грант-конкурсы для молодёжи | Эко-сообщества города"),
+    ("Психолог-консультант", "🧠", "Помогать людям справляться со стрессом и понимать себя.",
+     "общение,психология,помощь", "adult", 3,
+     "1) Бакалавриат по психологии 2) Личная терапия и супервизия 3) Первые клиенты в НКО",
+     "1 500–5 000 ₽ за сессию", "Психологические факультеты вузов | Обучающие программы с практикой"),
+    ("Продюсер цифровых продуктов", "🚀", "Собирать команды и запускать онлайн-курсы, приложения, подкасты.",
+     "it,общение,бизнес,маркетинг", "adult", 2,
+     "1) Основы продакт-менеджмента 2) Свой micro-запуск (лендинг + аудитория) 3) Нетворкинг в профильных чатах",
+     "150–400 тыс. ₽", "Книги по product management | Телеграм-сообщества продакт-менеджеров"),
+    ("Мастер новых ремёсел", "🪵", "Керамика, столярка, флористика — руки вместо зума и презентаций.",
+     "ремесло,creative,ручная_работа,антистресс", "adult", 3,
+     "1) Пробный мастер-класс 2) Первые заказы знакомым 3) Свои продажи через маркетплейсы",
+     "хендмейд-маркет / свой магазин", "Мастер-классы в городе | Ярмарки мастеров | Etsy/Livemaster"),
+    ("Карьерный навигатор / ментор", "🧭", "Помогать другим (как вы!) находить своё дело и менять траекторию.",
+     "общение,помощь,карьера", "adult", 3,
+     "1) Курс по карьерному консалтированию 2) 5 бесплатных консультаций для практики 3) Собственная методика",
+     "3 000–15 000 ₽ за консультацию", "Профпереподготовка | Супервизии | Сообщества карьерных консультантов"),
+]
+
+INTEREST_TAGS = ["it", "creative", "общение", "экология", "ремесло",
+                 "аналитика", "игры", "психология", "бизнес", "помощь"]
+
+
+def seed_db():
+    with db() as conn:
+        conn.executescript(SCHEMA)
+        if conn.execute("SELECT COUNT(*) FROM directions").fetchone()[0] == 0:
+            conn.executemany(
+                "INSERT INTO directions (title, emoji, description, tags, audience, fatigue_fit,"
+                " how_to_start, salary_range, resources) VALUES (?,?,?,?,?,?,?,?,?)",
+                SEED_DIRECTIONS,
+            )
+
+
+# ----------------------------------------------------------------------
+# 2. Персонализация: подбор направлений
+# ----------------------------------------------------------------------
+
+def recommend_for(user: dict, limit: int = 3) -> list:
+    """Скоринг: совпадения интересов + аудитория + усталость."""
+    interests = set(user.get("interests") or [])
+    rows = db().execute("SELECT * FROM directions").fetchall()
+    scored = []
+    for r in rows:
+        tags = {t.strip().lower() for t in r["tags"].split(",")}
+        score = len(interests & tags) * 10
+        if user.get("age_group") == "teen" and r["audience"] == "adult":
+            score -= 5
+        if user.get("fatigue") in ("tired", "burned_out"):
+            score += r["fatigue_fit"] * 4
+        scored.append((score, r))
+    scored.sort(key=lambda x: -x[0])
+    return [r for _, r in scored[:limit]]
+
+
+def format_direction(r) -> str:
+    return (
+        f"{r['emoji']} <b>{r['title']}</b>\n"
+        f"{r['description']}\n"
+        f"🚀 <b>С чего начать:</b> {r['how_to_start']}\n"
+        f"💰 <b>Ориентир по доходу:</b> {r['salary_range']}\n"
+        f"📚 <b>Ресурсы:</b> {r['resources']}"
+    )
+
+
+def interests_keyboard(selected: set) -> InlineKeyboardMarkup:
+    rows = []
+    for tag in INTEREST_TAGS:
+        mark = "✅ " if tag in selected else "▫️ "
+        rows.append([InlineKeyboardButton(
+            text=f"{mark}{tag}",
+            callback_data=f"int:{tag}",
+        )])
+    rows.append([InlineKeyboardButton(text="Готово ✔️", callback_data="int:done")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ----------------------------------------------------------------------
+# 3. Состояния анкеты (FSM)
+# ----------------------------------------------------------------------
+
+class Quiz(StatesGroup):
+    age = State()
+    interests = State()
+    fatigue = State()
+
+
+# ----------------------------------------------------------------------
+# 4. Меню и хендлеры
+# ----------------------------------------------------------------------
+
+def main_menu() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🎯 Мой профиль"), KeyboardButton(text="🔮 Подобрать направление")],
+            [KeyboardButton(text="📚 Все направления"), KeyboardButton(text="💡 Предложить идею")],
+            [KeyboardButton(text="❓ Помощь")],
+        ],
+        resize_keyboard=True,
+    )
+
+
+async def upsert_user(user_id: int, username: str | None, **fields):
+    now = int(time.time())
+    with db() as conn:
+        if not conn.execute("SELECT 1 FROM users WHERE user_id=?", (user_id,)).fetchone():
+            conn.execute("INSERT INTO users (user_id, username, created_at) VALUES (?,?,?)",
+                         (user_id, username, now))
+        for k, v in fields.items():
+            conn.execute(f"UPDATE users SET {k}=?, updated_at=? WHERE user_id=?",
+                         (v, now, user_id))
+
+
+def get_user(user_id: int) -> dict:
+    row = db().execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+    if not row:
+        return {}
+    u = dict(row)
+    u["interests"] = set(json.loads(u.get("interests") or "[]"))
+    return u
+
+
+
+@router.message(CommandStart())
+async def start(message: Message, state: FSMContext):
+    await state.clear()
+    await upsert_user(message.from_user.id, message.from_user.username)
+    await message.answer(
+        "Привет! Я CareerSpark ✨\n"
+        "Помогаю подросткам и уставшим от работы взрослым найти дело по душе.\n\n"
+        "Выберите кнопку внизу или напишите запрос текстом, например: "
+        "«хочу творчество», «интересуют игры и IT», «устал от офиса, что дальше?»",
+        reply_markup=main_menu(),
+    )
+
+
+@router.message(Command("help"))
+async def help_cmd(message: Message):
+    await message.answer(
+        "❓ <b>Как пользоваться</b>\n"
+        "• <b>🎯 Мой профиль</b> — пройти анкету заново\n"
+        "• <b>🔮 Подобрать направление</b> — рекомендации по анкете\n"
+        "• <b>📚 Все направления</b> — полный каталог\n"
+        "• <b>💡 Предложить идею</b> — ваше направление попадёт в базу для модерации\n\n"
+        "Или просто напишите текстом, что вас интересует — я поищу совпадения по тегам."
+    )
+
+
+# --- Анкета -------------------------------------------------------------
+
+@router.message(F.text == "🎯 Мой профиль")
+async def profile_start(message: Message, state: FSMContext):
+    await state.set_state(Quiz.age)
+    await message.answer(
+        "Начнём анкету! Первый вопрос:\n\n<b>Сколько вам лет?</b>\n(подросток / взрослый / предпочитаю не говорить)",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="Подросток"), KeyboardButton(text="Взрослый"),
+                       KeyboardButton(text="Пропустить")]],
+            resize_keyboard=True,
+        ),
+    )
+
+
+@router.message(Quiz.age)
+async def profile_age(message: Message, state: FSMContext):
+    mapping = {"подросток": "teen", "взрослый": "adult", "пропустить": "unknown"}
+    await upsert_user(message.from_user.id, message.from_user.username,
+                      age_group=mapping.get(message.text.lower(), "unknown"))
+    await state.set_state(Quiz.interests)
+    await message.answer(
+        "Отметьте, что вам интересно (можно несколько):",
+        reply_markup=interests_keyboard(set()),
+    )
+
+
+@router.callback_query(Quiz.interests, F.data.startswith("int:"))
+async def profile_interests(call: CallbackQuery, state: FSMContext):
+    tag = call.data[4:]
+    data = await state.get_data()
+    selected = set(data.get("interests", []))
+    if tag == "done":
+        await upsert_user(call.from_user.id, call.from_user.username,
+                          interests=json.dumps(sorted(selected), ensure_ascii=False))
+        await state.set_state(Quiz.fatigue)
+        await call.message.answer(
+            "Принято! Последний вопрос:\n\n<b>Как вы относитесь к своей текущей работе/учёбе?</b>",
+            reply_markup=ReplyKeyboardMarkup(
+                keyboard=[[KeyboardButton(text="Всё ок"), KeyboardButton(text="Подустал(а)"),
+                           KeyboardButton(text="Выгорание 🔥"), KeyboardButton(text="Пропустить")]],
+                resize_keyboard=True,
+            ),
+        )
+        await call.answer()
+        return
+    selected ^= {tag}
+    await state.update_data(interests=sorted(selected))
+    await call.message.edit_reply_markup(reply_markup=interests_keyboard(selected))
+    await call.answer()
+
+
+@router.message(Quiz.fatigue)
+async def profile_fatigue(message: Message, state: FSMContext):
+    mapping = {"всё ок": "none", "подустал(а)": "tired", "выгорание 🔥": "burned_out", "пропустить": "none"}
+    await upsert_user(message.from_user.id, message.from_user.username,
+                      fatigue=mapping.get(message.text.lower(), "none"))
+    await state.clear()
+    user = get_user(message.from_user.id)
+    recs = recommend_for(user)
+    text = "Готово! Профиль сохранён 💾\n\nВаши персональные рекомендации:\n\n" + "\n\n———\n\n".join(
+        format_direction(r) for r in recs)
+    await message.answer(text, reply_markup=main_menu())
+
+
+# --- Кнопки меню ---------------------------------------------------------
+
+@router.message(F.text == "🔮 Подобрать направление")
+async def recommend_btn(message: Message):
+    user = get_user(message.from_user.id)
+    if not user.get("interests"):
+        await message.answer("Сначала заполните анкету: нажмите «🎯 Мой профиль».")
+        return
+    recs = recommend_for(user)
+    await message.answer("Вот что подходит вам больше всего:\n\n" + "\n\n———\n\n".join(
+        format_direction(r) for r in recs))
+
+
+@router.message(F.text == "📚 Все направления")
+async def all_directions(message: Message):
+    rows = db().execute("SELECT emoji, title, description FROM directions ORDER BY title").fetchall()
+    await message.answer("📚 <b>Каталог направлений:</b>\n\n" + "\n".join(
+        f"{r['emoji']} <b>{r['title']}</b> — {r['description']}" for r in rows))
+
+
+@router.message(F.text == "💡 Предложить идею")
+async def idea_start(message: Message, state: FSMContext):
+    await state.set_state(Suggestion.waiting)
+    await message.answer("Напишите в свободной форме, какое направление или ресурс стоит добавить в базу.")
+
+
+class Suggestion(StatesGroup):
+    waiting = State()
+
+
+@router.message(Suggestion.waiting)
+async def idea_save(message: Message, state: FSMContext):
+    with db() as conn:
+        conn.execute("INSERT INTO suggestions (user_id, text, created_at) VALUES (?,?,?)",
+                     (message.from_user.id, message.text, int(time.time())))
+    await state.clear()
+    await message.answer("Спасибо! Идея сохранена, админы её рассмотрят 💡", reply_markup=main_menu())
+
+
+# --- Свободный текст: поиск по тегам --------------------------------------
+
+@router.message(F.text)
+async def free_text_search(message: Message):
+    if message.text == "❓ Помощь":
+        await help_cmd(message)
+        return
+    words = [w.strip(",.?!").lower() for w in message.text.split() if len(w) > 2]
+    rows = db().execute("SELECT * FROM directions").fetchall()
+    scored = []
+    for r in rows:
+        haystack = (r["title"] + " " + r["description"] + " " + r["tags"]).lower()
+        hits = sum(1 for w in words if w in haystack)
+        if hits:
+            scored.append((hits, r))
+    if not scored:
+        await message.answer(
+            "Не нашёл совпадений 🤔 Попробуйте другое слово или выберите «📚 Все направления».\n"
+            "А если вашего направления нет — «💡 Предложить идею»!")
+        return
+    scored.sort(key=lambda x: -x[0])
+    await message.answer("Нашёл вот это 👇\n\n" + "\n\n———\n\n".join(
+        format_direction(r) for _, r in scored[:3]))
+
+
+# ----------------------------------------------------------------------
+# 5. Запуск
+# ----------------------------------------------------------------------
+
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    seed_db()
+    bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    dp = Dispatcher()
+    dp.include_router(router)
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
